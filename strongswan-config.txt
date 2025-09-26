@@ -1,0 +1,179 @@
+After doing terraform deploy we need to ssh to the ec2 instance with strongswan and update it.
+ssh -i ec2_private_key.pem ubuntu@<public_ip>
+
+1. Open /etc/sysctl.conf and uncomment the following line to enable IP packet forwarding:
+sudo nano /etc/sysctl.conf
+
+net.ipv4.ip_forward = 1
+
+Apply the changes in step 1:
+sudo sysctl -p
+
+2. sudo nano /etc/ipsec.secrets
+
+# <your-strongswan-public-ip> is the strongswan_eip output.
+# Replace <AWS_TUNNEL1_PSK> and <AWS_TUNNEL2_PSK> with the values from terraform output vpn_configuration
+
+<your-strongswan-public-ip> <aws_vpn_public-ip1> : PSK "<AWS_TUNNEL1_PSK>"
+<your-strongswan-public-ip> <aws_vpn_public-ip2> : PSK "<AWS_TUNNEL2_PSK>"
+
+3. sudo nano /etc/ipsec.conf
+
+# Tunnel 1
+conn Tunnel1
+	auto=start
+	left=%defaultroute
+	leftid=107.23.109.73 #strongswan public ip
+	right=44.196.150.7 #aws vpn tunnel 1 public ip
+	type=tunnel
+	leftauth=psk
+	rightauth=psk
+	keyexchange=ikev1
+	ike=aes128-sha1-modp1024
+	ikelifetime=8h
+	esp=aes128-sha1-modp1024
+	lifetime=1h
+	keyingtries=%forever
+	leftsubnet=0.0.0.0/0
+	rightsubnet=0.0.0.0/0
+	dpddelay=10s
+	dpdtimeout=30s
+	dpdaction=restart
+	mark=100
+
+# Tunnel 2
+conn Tunnel2
+	auto=start
+	left=%defaultroute
+	leftid=107.23.109.73 #strongswan public ip
+	right=100.26.15.189 #aws vpn tunnel 2 public ip
+	type=tunnel
+	leftauth=psk
+	rightauth=psk
+	keyexchange=ikev1
+	ike=aes128-sha1-modp1024
+	ikelifetime=8h
+	esp=aes128-sha1-modp1024
+	lifetime=1h
+	keyingtries=%forever
+	leftsubnet=0.0.0.0/0
+	rightsubnet=0.0.0.0/0
+	dpddelay=10s
+	dpdtimeout=30s
+	dpdaction=restart
+	mark=200
+
+4. 
+sudo chmod 600 /etc/strongswan.conf
+sudo nano /etc/strongswan.conf
+
+charon {
+        install_routes=no  #this should be the only addition, the rest are defaults
+        load_modular = yes
+        plugins {
+                include strongswan.d/charon/*.conf
+        }
+}
+
+include strongswan.d/*.conf
+
+anyways, the vpn tunnel should be up at this point.
+sudo ipsec restart
+sudo ipsec statusall
+
+5. create tunnel ints:
+use ip addr to get private ip for below..
+<LOCAL IP> is PRIVATE IP w NO SUBNET (ens5 or whatever int's ip) for a device in a VPC such as this since it is natted.
+If it wasn't being natted, we'd use the public int ip.
+For the inside tunnel ips (from the vpn config) INCLUDE SUBNET. 
+
+sudo ip link add Tunnel1 type vti local <Local_IP> remote <remote_PUBLIC_IP_tun1> key 100
+sudo ip addr add <local_PRIVATE_IP_tun2> remote <remote_PRIVATE_IP_tun2> dev Tunnel1
+sudo ip link set Tunnel1 up mtu 1419
+
+sudo ip link add Tunnel2 type vti local <Local_IP> remote <remote_PUBLIC_IP_tun2> key 200
+sudo ip addr add <local_PRIVATE_IP_tun2> remote <remote_PRIVATE_IP_tun2> dev Tunnel2
+sudo ip link set Tunnel2 up mtu 1419
+
+6. configure routing:
+#subnet is the remote vpc subnet
+
+sudo ip route add 10.10.0.0/16 dev Tunnel1 metric 50
+sudo ip route add 10.10.0.0/16 dev Tunnel2 metric 60
+
+7. configure iptables (kernel firewall):
+# Add rule to clamp TCP MSS to prevent fragmentation over the tunnel (Good Practice)
+sudo iptables -t mangle -A FORWARD -o Tunnel1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+sudo iptables -t mangle -A FORWARD -o Tunnel2 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# Allow traffic to be forwarded from your LAN (ens5) into the tunnels
+sudo iptables -A FORWARD -i ens5 -o Tunnel1 -j ACCEPT
+sudo iptables -A FORWARD -i ens5 -o Tunnel2 -j ACCEPT
+
+# IMPORTANT: Allow return traffic from the tunnels back to your LAN
+sudo iptables -A FORWARD -i Tunnel1 -o ens5 -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -i Tunnel2 -o ens5 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+Save the rules to make them permanent
+sudo netfilter-persistent save
+
+8. edit /etc/sysctl.conf and edit and then append the lines:
+sudo nano /etc/sysctl.conf
+
+#remove the comment if we didn't already:
+net.ipv4.ip_forward=1 # enables ip forwarding
+
+# remove the comment and change to "2":
+net.ipv4.conf.all.rp_filter=2
+
+apply with:
+sudo sysctl -p
+
+9. restart services
+sudo systemctl restart strongswan-starter
+sudo ipsec restart
+
+10. verify config
+Check config with these commands:
+sudo journalctl -u strongswan-starter -f 
+sudo ipsec statusall
+ip addr show # should see tunnel ints we made
+ip route # should see routes we made
+
+11. testing
+test ping to remote vpc subnet device from strongswan itself:
+make sure to use the correct ping syntax or it will source it from the tunnel's 169.254 ip!
+example:
+ping -I <local_Private_IP> <remote_Private_IP_across_VPN>
+
+connect to private onprem device to test ping from there:
+#from your machine's local cli, copy the private key to the strongswan server
+scp -i ./ec2_private_key.pem ./ec2_private_key.pem ubuntu@<strongswan_public_ip>:~/.ssh/
+then log back into strongswan server (acting as bastion now):
+ssh -i ec2_private_key.pem ubuntu@<strongswan_public_ip>
+chmod 400 ~/.ssh/ec2_private_key.pem
+then connect to private ec2 from strongswan ec2:
+ssh -i ./.ssh/ec2_private_key.pem ubuntu@<onprem_ec2_privateIP>
+
+optional:
+Persistent Configuration for tunnels on strongswan:
+# this is from aws's strongswan config document, I didn't make this part:
+
+Your tunnel interface is now ready for use, however if your device ever reboots the changes you've made will not persist. Complete the following steps so your changes will remain persistent after reboot.
+1) Save your running iptables configuration by executing the command 'sudo iptables-save > /etc/iptables.conf'
+2) Open /etc/rc.local and append the following to the end of the file, before the line 'exit 0':
+iptables-restore < /etc/iptables.conf
+3) Open /etc/network/interfaces and append the following to the end of the file. If your device is in a VPC or behind a device performing NAT on your local network, replace <LOCAL IP> with the private IP of the device. Otherwise, use 107.23.109.73. The "key" value below MUST match the integer you placed as the "mark" value in your configuration file.
+# change ips for your setup!
+
+auto Tunnel1
+iface Tunnel1 inet manual
+pre-up ip link add Tunnel1 type vti local <LOCAL IP> remote 44.196.150.7 key 100
+pre-up ip addr add 169.254.163.202/30 remote 169.254.163.201/30 dev Tunnel1
+up ip link set Tunnel1 up mtu 1419
+
+auto Tunnel2
+iface Tunnel2 inet manual
+pre-up ip link add Tunnel2 type vti local <LOCAL IP> remote 44.196.150.7 key 100
+pre-up ip addr add 169.254.163.202/30 remote 169.254.163.201/30 dev Tunnel2
+up ip link set Tunnel2 up mtu 1419
